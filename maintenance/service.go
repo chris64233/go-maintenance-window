@@ -108,6 +108,13 @@ func (s *Service) validate(in RequestInput) error {
 	if in.Duration <= 0 || in.Start.Before(s.now()) {
 		return ErrInvalidTimeRange
 	}
+	seenStep := make(map[string]bool, len(in.PrepSteps))
+	for _, step := range in.PrepSteps {
+		if seenStep[step] {
+			return fmt.Errorf("%w: %s", ErrDuplicatePrepStep, step)
+		}
+		seenStep[step] = true
+	}
 	return nil
 }
 
@@ -171,20 +178,25 @@ func (s *Service) ModifyRequest(id string, in RequestInput) (*Request, error) {
 	if err := s.validate(in); err != nil {
 		return nil, err
 	}
+	newResources := sortedUnique(in.ResourceIDs)
+	newSteps := append([]string(nil), in.PrepSteps...)
 	changed := !req.Start.Equal(in.Start) ||
 		req.Duration != in.Duration ||
-		!equalStrings(req.ResourceIDs, sortedUnique(in.ResourceIDs)) ||
-		!equalStrings(req.PrepSteps, in.PrepSteps)
+		!equalStrings(req.ResourceIDs, newResources) ||
+		!equalStrings(req.PrepSteps, newSteps)
 	if changed {
 		req.Version++
 		req.PrepDone = make(map[string]bool)
 	}
-	req.ResourceIDs = sortedUnique(in.ResourceIDs)
+	req.ResourceIDs = newResources
 	req.Start = in.Start
 	req.Duration = in.Duration
-	req.PrepSteps = append([]string(nil), in.PrepSteps...)
-	req.Status = StatusPending
-	if len(req.PrepSteps) == 0 {
+	req.PrepSteps = newSteps
+	// 只有内容变化才需要重新准备；无实际变化的修改保持原状态。
+	if changed {
+		req.Status = StatusPending
+	}
+	if changed && len(req.PrepSteps) == 0 {
 		req.Status = StatusReady
 	}
 	req.UpdatedAt = s.now()
@@ -303,7 +315,8 @@ func (s *Service) acquireLocked(resourceID string, req *Request, now time.Time) 
 	_ = now
 }
 
-// releaseLocked 释放指定申请在 resources 上的占用并恢复资源运行状态。
+// releaseLocked 释放指定申请在 resources 上的占用。资源状态由剩余占用推导：
+// 该资源上仍存在其它执行中窗口时保持 maintenance（例如首尾相接、互不重叠的两段维护）。
 func (s *Service) releaseLocked(resources []string, requestID string) {
 	if len(resources) == 0 {
 		return
@@ -312,7 +325,7 @@ func (s *Service) releaseLocked(resources []string, requestID string) {
 	for _, r := range resources {
 		inSet[r] = true
 	}
-	kept := s.store.st.Occupancy[:0]
+	kept := make([]Window, 0, len(s.store.st.Occupancy))
 	for _, w := range s.store.st.Occupancy {
 		if w.RequestID == requestID && inSet[w.ResourceID] {
 			continue
@@ -320,9 +333,15 @@ func (s *Service) releaseLocked(resources []string, requestID string) {
 		kept = append(kept, w)
 	}
 	s.store.st.Occupancy = kept
+	stillBusy := make(map[string]bool)
+	for _, w := range kept {
+		stillBusy[w.ResourceID] = true
+	}
 	for _, rid := range resources {
 		if r, ok := s.store.st.Resources[rid]; ok {
-			r.Status = ResourceRunning
+			if !stillBusy[rid] {
+				r.Status = ResourceRunning
+			}
 		}
 	}
 }

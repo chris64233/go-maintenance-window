@@ -102,6 +102,7 @@ var (
 	ErrResourceBusy      = errors.New("maintenance: resource window overlaps an active maintenance")
 	ErrWindowNotReached  = errors.New("maintenance: maintenance window has not started yet")
 	ErrUnknownPrepStep   = errors.New("maintenance: unknown preparation step")
+	ErrDuplicatePrepStep = errors.New("maintenance: duplicate preparation step in request")
 	ErrStalePrepVersion  = errors.New("maintenance: preparation receipt belongs to an old version")
 )
 
@@ -114,5 +115,14 @@ func Overlaps(s1, e1, s2, e2 time.Time) bool {
 func sortedUnique(ids []string) []string {
 	out := append([]string(nil), ids...)
 	sort.Strings(out)
-	return out
+	if len(out) <= 1 {
+		return out
+	}
+	kept := out[:1]
+	for _, id := range out[1:] {
+		if id != kept[len(kept)-1] {
+			kept = append(kept, id)
+		}
+	}
+	return kept
 }
