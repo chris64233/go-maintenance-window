@@ -108,6 +108,16 @@ func (s *Service) validate(in RequestInput) error {
 	if in.Duration <= 0 || in.Start.Before(s.now()) {
 		return ErrInvalidTimeRange
 	}
+	seenStep := make(map[string]bool, len(in.PrepSteps))
+	for _, step := range in.PrepSteps {
+		if step == "" {
+			return ErrEmptyPrepStep
+		}
+		if seenStep[step] {
+			return fmt.Errorf("%w: %s", ErrDuplicatePrepStep, step)
+		}
+		seenStep[step] = true
+	}
 	return nil
 }
 
@@ -183,9 +193,13 @@ func (s *Service) ModifyRequest(id string, in RequestInput) (*Request, error) {
 	req.Start = in.Start
 	req.Duration = in.Duration
 	req.PrepSteps = append([]string(nil), in.PrepSteps...)
-	req.Status = StatusPending
-	if len(req.PrepSteps) == 0 {
-		req.Status = StatusReady
+	// 内容未变化时保留版本、已收回执与生命周期状态（空修改不得把
+	// ready 打回 pending）；发生变化时旧回执失效，按新步骤集重新判定。
+	if changed {
+		req.Status = StatusPending
+		if len(req.PrepSteps) == 0 || len(req.PrepDone) == len(req.PrepSteps) {
+			req.Status = StatusReady
+		}
 	}
 	req.UpdatedAt = s.now()
 	if err := s.store.save(); err != nil {
@@ -265,15 +279,15 @@ func (s *Service) Start(requestID string) error {
 	if !now.Before(req.End()) {
 		return s.finalizeLocked(req, StatusExpired, "maintenance window missed", now)
 	}
-	// 逐资源尝试占用；任何冲突都回滚已占用的部分。
-	acquired := make([]string, 0, len(req.ResourceIDs))
+	// 先校验全部资源均可用，再一次性占用，保证“取得全部或什么都不取”，
+	// 不会出现部分资源被改状态后再回滚的中间态。
 	for _, rid := range req.ResourceIDs {
 		if s.resourceBusyLocked(rid, req.Start, req.End()) {
-			s.releaseLocked(acquired, req.ID)
 			return fmt.Errorf("%w: %s", ErrResourceBusy, rid)
 		}
-		s.acquireLocked(rid, req, now)
-		acquired = append(acquired, rid)
+	}
+	for _, rid := range req.ResourceIDs {
+		s.acquireLocked(rid, req)
 	}
 	req.Status = StatusExecuting
 	req.UpdatedAt = now
@@ -289,7 +303,7 @@ func (s *Service) resourceBusyLocked(resourceID string, start, end time.Time) bo
 	return false
 }
 
-func (s *Service) acquireLocked(resourceID string, req *Request, now time.Time) {
+func (s *Service) acquireLocked(resourceID string, req *Request) {
 	s.store.st.Occupancy = append(s.store.st.Occupancy, Window{
 		ResourceID: resourceID,
 		RequestID:  req.ID,
@@ -300,7 +314,6 @@ func (s *Service) acquireLocked(resourceID string, req *Request, now time.Time) 
 	if r, ok := s.store.st.Resources[resourceID]; ok {
 		r.Status = ResourceMaintenance
 	}
-	_ = now
 }
 
 // releaseLocked 释放指定申请在 resources 上的占用并恢复资源运行状态。

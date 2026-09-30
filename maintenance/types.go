@@ -102,6 +102,8 @@ var (
 	ErrResourceBusy      = errors.New("maintenance: resource window overlaps an active maintenance")
 	ErrWindowNotReached  = errors.New("maintenance: maintenance window has not started yet")
 	ErrUnknownPrepStep   = errors.New("maintenance: unknown preparation step")
+	ErrEmptyPrepStep     = errors.New("maintenance: preparation step must not be empty")
+	ErrDuplicatePrepStep = errors.New("maintenance: duplicate preparation step in request")
 	ErrStalePrepVersion  = errors.New("maintenance: preparation receipt belongs to an old version")
 )
 

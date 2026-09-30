@@ -545,3 +545,139 @@ func mustStoreForExample() *Store {
 	st, _ := OpenStore("")
 	return st
 }
+
+func TestDuplicatePrepStepsRejected(t *testing.T) {
+	env := newTestEnv(t, "db-1")
+	in := RequestInput{
+		ResourceIDs: []string{"db-1"},
+		Start:       base.Add(time.Hour),
+		Duration:    time.Hour,
+		PrepSteps:   []string{"backup", "backup"},
+	}
+	if _, err := env.svc.CreateRequest(in); !errors.Is(err, ErrDuplicatePrepStep) {
+		t.Fatalf("create: want ErrDuplicatePrepStep, got %v", err)
+	}
+	req, err := env.svc.CreateRequest(RequestInput{
+		ResourceIDs: []string{"db-1"},
+		Start:       base.Add(time.Hour),
+		Duration:    time.Hour,
+		PrepSteps:   []string{"backup"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	in.PrepSteps = []string{"", "notify"}
+	if _, err := env.svc.ModifyRequest(req.ID, in); !errors.Is(err, ErrEmptyPrepStep) {
+		t.Fatalf("modify: want ErrEmptyPrepStep, got %v", err)
+	}
+}
+
+func TestModifyNoChangeKeepsReadyAndReceipts(t *testing.T) {
+	env := newTestEnv(t, "db-1")
+	in := RequestInput{
+		ResourceIDs: []string{"db-1"},
+		Start:       base.Add(time.Hour),
+		Duration:    time.Hour,
+		PrepSteps:   []string{"backup", "notify"},
+	}
+	req, _ := env.svc.CreateRequest(in)
+	if err := env.svc.ReportPrep(req.ID, 1, "backup"); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.svc.ReportPrep(req.ID, 1, "notify"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := env.svc.GetRequest(req.ID)
+	if got.Status != StatusReady {
+		t.Fatalf("status = %s, want ready", got.Status)
+	}
+
+	// 完全相同的修改：版本、回执、ready 状态都必须保留。
+	same, err := env.svc.ModifyRequest(req.ID, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if same.Version != 1 || same.Status != StatusReady || len(same.PrepDone) != 2 {
+		t.Fatalf("no-op modify lost state: %+v", same)
+	}
+	env.advance(time.Hour)
+	if err := env.svc.Start(req.ID); err != nil {
+		t.Fatalf("ready request must still start after no-op modify: %v", err)
+	}
+}
+
+func TestModifyOnlyTimeBumpsVersion(t *testing.T) {
+	env := newTestEnv(t, "db-1")
+	in := RequestInput{
+		ResourceIDs: []string{"db-1"},
+		Start:       base.Add(time.Hour),
+		Duration:    time.Hour,
+		PrepSteps:   []string{"backup"},
+	}
+	req, _ := env.svc.CreateRequest(in)
+	if err := env.svc.ReportPrep(req.ID, 1, "backup"); err != nil {
+		t.Fatal(err)
+	}
+	// 仅修改持续时间也必须递增版本（旧回执失效）。
+	updated, err := env.svc.ModifyRequest(req.ID, RequestInput{
+		ResourceIDs: []string{"db-1"},
+		Start:       base.Add(time.Hour),
+		Duration:    2 * time.Hour,
+		PrepSteps:   []string{"backup"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Version != 2 || updated.Status != StatusPending {
+		t.Fatalf("want version 2 pending, got %+v", updated)
+	}
+	if err := env.svc.ReportPrep(req.ID, 1, "backup"); !errors.Is(err, ErrStalePrepVersion) {
+		t.Fatalf("old-version receipt after duration change: want ErrStalePrepVersion, got %v", err)
+	}
+	if err := env.svc.ReportPrep(req.ID, 2, "backup"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := env.svc.GetRequest(req.ID); got.Status != StatusReady {
+		t.Fatalf("status = %s, want ready", got.Status)
+	}
+}
+
+func TestOverlappingScheduledWindowsArbitratedAtStart(t *testing.T) {
+	env := newTestEnv(t, "db-1", "db-2")
+	// 两个申请在 db-1 上的排期重叠：创建均允许（资源仍 running），
+	// 开始时只有先取得 db-1 的一方执行，另一方失败且不锁资源。
+	a, _ := env.svc.CreateRequest(input(base.Add(time.Hour), time.Hour, "db-1"))
+	b, _ := env.svc.CreateRequest(input(base.Add(90*time.Minute), time.Hour, "db-1", "db-2"))
+	for _, r := range env.svc.Resources() {
+		if r.Status != ResourceRunning {
+			t.Fatalf("resource %s changed before start: %s", r.ID, r.Status)
+		}
+	}
+	env.advance(time.Hour)
+	if err := env.svc.Start(a.ID); err != nil {
+		t.Fatal(err)
+	}
+	env.advance(30 * time.Minute) // 到达 b 的窗口起点
+	if err := env.svc.Start(b.ID); !errors.Is(err, ErrResourceBusy) {
+		t.Fatalf("want ErrResourceBusy, got %v", err)
+	}
+	gb, _ := env.svc.GetRequest(b.ID)
+	if gb.Status != StatusReady {
+		t.Fatalf("blocked request status = %s, want ready", gb.Status)
+	}
+	if r := env.svc.Resources()[1]; r.Status != ResourceRunning {
+		t.Fatalf("db-2 must not be locked by the failed start: %s", r.Status)
+	}
+	// 胜方完成后，败方窗口（2:30-3:30）在当前时刻之后仍可取得资源开始。
+	if err := env.svc.Complete(a.ID, "done"); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.svc.Start(b.ID); err != nil {
+		t.Fatalf("loser should start after winner releases resources: %v", err)
+	}
+	for _, r := range env.svc.Resources() {
+		if r.Status != ResourceMaintenance {
+			t.Fatalf("resource %s status = %s, want maintenance", r.ID, r.Status)
+		}
+	}
+}
