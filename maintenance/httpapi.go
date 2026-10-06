@@ -16,8 +16,14 @@ import (
 //	POST /requests/{id}/modify      修改申请（递增版本）
 //	POST /requests/{id}/prep        准备回执        {"version","step"}
 //	POST /requests/{id}/start       开始维护
+//	POST /requests/{id}/reschedule  重排待重排窗口  {"start"}
 //	POST /requests/{id}/complete    完成            {"reason"}
 //	POST /requests/{id}/abort       中止            {"reason"}
+//	POST /emergencies               登记紧急插入    {"idempotency_key","resource_ids","start","duration_minutes","reason"}
+//	GET  /emergencies/{id}          紧急插入查询（排期前后对比/受影响窗口/占用/重排原因）
+//	POST /emergencies/{id}/confirm  确认插入（原子取得全部资源）
+//	POST /emergencies/{id}/cancel   取消紧急申请
+//	POST /emergencies/{id}/complete 完成紧急窗口
 //	POST /expire                    触发超时处理
 //	GET  /calendar?from=&to=        日历查询（RFC3339）
 //	GET  /history                   定案历史
@@ -72,11 +78,65 @@ func NewHandler(svc *Service) http.Handler {
 	mux.HandleFunc("POST /requests/{id}/start", func(w http.ResponseWriter, r *http.Request) {
 		respond(w, map[string]string{"status": "ok"}, svc.Start(r.PathValue("id")))
 	})
+	mux.HandleFunc("POST /requests/{id}/reschedule", func(w http.ResponseWriter, r *http.Request) {
+		var in struct {
+			Start string `json:"start"`
+		}
+		if !decode(w, r, &in) {
+			return
+		}
+		start, err := time.Parse(time.RFC3339, in.Start)
+		if err != nil {
+			respond(w, nil, errors.New("start must be an RFC3339 timestamp"))
+			return
+		}
+		req, err := svc.Reschedule(r.PathValue("id"), start)
+		respond(w, req, err)
+	})
 	mux.HandleFunc("POST /requests/{id}/complete", func(w http.ResponseWriter, r *http.Request) {
 		respond(w, map[string]string{"status": "ok"}, svc.Complete(r.PathValue("id"), reasonBody(w, r)))
 	})
 	mux.HandleFunc("POST /requests/{id}/abort", func(w http.ResponseWriter, r *http.Request) {
 		respond(w, map[string]string{"status": "ok"}, svc.Abort(r.PathValue("id"), reasonBody(w, r)))
+	})
+	mux.HandleFunc("POST /emergencies", func(w http.ResponseWriter, r *http.Request) {
+		var in struct {
+			IdempotencyKey  string   `json:"idempotency_key"`
+			ResourceIDs     []string `json:"resource_ids"`
+			Start           string   `json:"start"`
+			DurationMinutes int      `json:"duration_minutes"`
+			Reason          string   `json:"reason"`
+		}
+		if !decode(w, r, &in) {
+			return
+		}
+		start, err := time.Parse(time.RFC3339, in.Start)
+		if err != nil {
+			respond(w, nil, errors.New("start must be an RFC3339 timestamp"))
+			return
+		}
+		e, err := svc.CreateEmergency(EmergencyInput{
+			IdempotencyKey: in.IdempotencyKey,
+			ResourceIDs:    in.ResourceIDs,
+			Reason:         in.Reason,
+			Start:          start,
+			Duration:       time.Duration(in.DurationMinutes) * time.Minute,
+		})
+		respond(w, e, err)
+	})
+	mux.HandleFunc("GET /emergencies/{id}", func(w http.ResponseWriter, r *http.Request) {
+		report, err := svc.EmergencyReport(r.PathValue("id"))
+		respond(w, report, err)
+	})
+	mux.HandleFunc("POST /emergencies/{id}/confirm", func(w http.ResponseWriter, r *http.Request) {
+		e, err := svc.ConfirmEmergency(r.PathValue("id"))
+		respond(w, e, err)
+	})
+	mux.HandleFunc("POST /emergencies/{id}/cancel", func(w http.ResponseWriter, r *http.Request) {
+		respond(w, map[string]string{"status": "ok"}, svc.CancelEmergency(r.PathValue("id")))
+	})
+	mux.HandleFunc("POST /emergencies/{id}/complete", func(w http.ResponseWriter, r *http.Request) {
+		respond(w, map[string]string{"status": "ok"}, svc.CompleteEmergency(r.PathValue("id")))
 	})
 	mux.HandleFunc("POST /expire", func(w http.ResponseWriter, r *http.Request) {
 		respond(w, map[string][]string{"expired": svc.Expire()}, nil)

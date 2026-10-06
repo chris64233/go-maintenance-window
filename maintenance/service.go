@@ -64,7 +64,7 @@ func (s *Service) RegisterResource(id, name string) (*Resource, error) {
 	if _, ok := s.store.st.Resources[id]; ok {
 		return nil, ErrResourceExists
 	}
-	r := &Resource{ID: id, Name: name, Status: ResourceRunning}
+	r := &Resource{ID: id, Name: name, Status: ResourceRunning, Version: 1}
 	s.store.st.Resources[id] = r
 	return r, s.store.save()
 }
@@ -265,15 +265,14 @@ func (s *Service) Start(requestID string) error {
 	if !now.Before(req.End()) {
 		return s.finalizeLocked(req, StatusExpired, "maintenance window missed", now)
 	}
-	// 逐资源尝试占用；任何冲突都回滚已占用的部分。
-	acquired := make([]string, 0, len(req.ResourceIDs))
+	// 先整体检查再整体占用：任何冲突都不会留下部分占用。
 	for _, rid := range req.ResourceIDs {
 		if s.resourceBusyLocked(rid, req.Start, req.End()) {
-			s.releaseLocked(acquired, req.ID)
 			return fmt.Errorf("%w: %s", ErrResourceBusy, rid)
 		}
-		s.acquireLocked(rid, req, now)
-		acquired = append(acquired, rid)
+	}
+	for _, rid := range req.ResourceIDs {
+		s.acquireLocked(rid, req.ID, req.Start, req.End())
 	}
 	req.Status = StatusExecuting
 	req.UpdatedAt = now
@@ -289,21 +288,22 @@ func (s *Service) resourceBusyLocked(resourceID string, start, end time.Time) bo
 	return false
 }
 
-func (s *Service) acquireLocked(resourceID string, req *Request, now time.Time) {
+func (s *Service) acquireLocked(resourceID, requestID string, start, end time.Time) {
 	s.store.st.Occupancy = append(s.store.st.Occupancy, Window{
 		ResourceID: resourceID,
-		RequestID:  req.ID,
+		RequestID:  requestID,
 		Kind:       "active",
-		Start:      req.Start,
-		End:        req.End(),
+		Start:      start,
+		End:        end,
 	})
 	if r, ok := s.store.st.Resources[resourceID]; ok {
 		r.Status = ResourceMaintenance
+		r.Version++
 	}
-	_ = now
 }
 
 // releaseLocked 释放指定申请在 resources 上的占用并恢复资源运行状态。
+// 只移除 RequestID 匹配的占用记录，因此迟到的释放不会误删别人的窗口。
 func (s *Service) releaseLocked(resources []string, requestID string) {
 	if len(resources) == 0 {
 		return
@@ -322,7 +322,10 @@ func (s *Service) releaseLocked(resources []string, requestID string) {
 	s.store.st.Occupancy = kept
 	for _, rid := range resources {
 		if r, ok := s.store.st.Resources[rid]; ok {
-			r.Status = ResourceRunning
+			if r.Status != ResourceRunning {
+				r.Status = ResourceRunning
+				r.Version++
+			}
 		}
 	}
 }
@@ -405,11 +408,25 @@ func (s *Service) Expire() []string {
 			}
 		}
 	}
+	// 执行超过预计时长的紧急窗口同样被定案并释放资源。
+	eids := make([]string, 0, len(s.store.st.Emergencies))
+	for id := range s.store.st.Emergencies {
+		eids = append(eids, id)
+	}
+	sort.Strings(eids)
+	for _, id := range eids {
+		e := s.store.st.Emergencies[id]
+		if e.Status == EmergencyExecuting && !now.Before(e.End()) {
+			s.finalizeEmergencyLocked(e, EmergencyExpired, now)
+			expired = append(expired, id)
+		}
+	}
 	return expired
 }
 
 // Calendar 返回与 [from, to) 重叠的全部窗口：执行中的实际占用（active）
 // 以及已排期但尚未开始的计划窗口（scheduled），按开始时间排序。
+// 待重排（reschedule）的窗口仍按原计划时间列出，不会被悄悄移除。
 func (s *Service) Calendar(from, to time.Time) []Window {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -420,7 +437,7 @@ func (s *Service) Calendar(from, to time.Time) []Window {
 		}
 	}
 	for _, req := range s.store.st.Requests {
-		if req.Status != StatusPending && req.Status != StatusReady {
+		if req.Status != StatusPending && req.Status != StatusReady && req.Status != StatusReschedule {
 			continue
 		}
 		if !Overlaps(from, to, req.Start, req.End()) {
