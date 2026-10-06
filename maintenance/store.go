@@ -7,20 +7,22 @@ import (
 	"path/filepath"
 )
 
-// state 是需要持久化的全部数据：资源、申请、执行中占用、
+// state 是需要持久化的全部数据：资源、申请、紧急插入申请、执行中占用、
 // 最终定案历史与通知记录。
 type state struct {
-	Resources     map[string]*Resource `json:"resources"`
-	Requests      map[string]*Request  `json:"requests"`
-	Occupancy     []Window             `json:"occupancy"`
-	History       []FinalRecord        `json:"history"`
-	Notifications []Notification       `json:"notifications"`
+	Resources     map[string]*Resource         `json:"resources"`
+	Requests      map[string]*Request          `json:"requests"`
+	Emergencies   map[string]*EmergencyRequest `json:"emergencies"`
+	Occupancy     []Window                     `json:"occupancy"`
+	History       []FinalRecord                `json:"history"`
+	Notifications []Notification               `json:"notifications"`
 }
 
 func newState() state {
 	return state{
-		Resources: make(map[string]*Resource),
-		Requests:  make(map[string]*Request),
+		Resources:   make(map[string]*Resource),
+		Requests:    make(map[string]*Request),
+		Emergencies: make(map[string]*EmergencyRequest),
 	}
 }
 
@@ -53,6 +55,9 @@ func OpenStore(path string) (*Store, error) {
 	}
 	if s.st.Requests == nil {
 		s.st.Requests = make(map[string]*Request)
+	}
+	if s.st.Emergencies == nil {
+		s.st.Emergencies = make(map[string]*EmergencyRequest)
 	}
 	return s, nil
 }
